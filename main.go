@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/leafo/folio/internal/folio"
 )
@@ -19,6 +19,7 @@ func main() {
 		chunkSize    int
 		chunkOverlap int
 		extensions   string
+		watchMode    bool
 	)
 
 	flag.StringVar(&root, "root", ".", "root directory to scan")
@@ -26,6 +27,7 @@ func main() {
 	flag.IntVar(&chunkSize, "chunk-size", 200, "number of lines per chunk")
 	flag.IntVar(&chunkOverlap, "chunk-overlap", 20, "number of overlapping lines between consecutive chunks")
 	flag.StringVar(&extensions, "extensions", ".txt,.md,.rst,.go,.py,.js,.ts,.tsx,.json,.yaml,.yml,.toml", "comma separated list of file extensions to include")
+	flag.BoolVar(&watchMode, "watch", false, "enable watch mode to process changes continuously")
 	flag.Parse()
 
 	handler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})
@@ -36,6 +38,13 @@ func main() {
 		logger.Error("No extensions provided")
 		os.Exit(1)
 	}
+
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		logger.Error("Failed to resolve root", "root", root, "error", err)
+		os.Exit(1)
+	}
+	root = absRoot
 
 	if chunkSize <= 0 {
 		logger.Error("Chunk size must be positive", "chunk_size", chunkSize)
@@ -50,8 +59,7 @@ func main() {
 		chunkOverlap = chunkSize - 1
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	ctx := context.Background()
 
 	db, err := folio.OpenDatabase(ctx, dbPath)
 	if err != nil {
@@ -72,6 +80,15 @@ func main() {
 	if err := folio.Synchronize(ctx, db, root, opts); err != nil {
 		logger.Error("Synchronization failed", "error", err)
 		os.Exit(1)
+	}
+
+	if watchMode {
+		logger.Info("Entering watch mode")
+		if err := folio.WatchAndSync(ctx, db, root, opts); err != nil {
+			logger.Error("Watch mode terminated", "error", err)
+			os.Exit(1)
+		}
+		return
 	}
 
 	fmt.Fprintln(os.Stdout, "synchronization complete")

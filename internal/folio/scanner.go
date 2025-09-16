@@ -31,14 +31,17 @@ func CollectFiles(root string, extensions []string) ([]string, error) {
 	}
 
 	var files []string
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() {
-			return nil
-		}
-		ext := strings.ToLower(filepath.Ext(d.Name()))
+    err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+        if err != nil {
+            return err
+        }
+        if d.IsDir() {
+            if d.Name() == ".git" {
+                return fs.SkipDir
+            }
+            return nil
+        }
+        ext := strings.ToLower(filepath.Ext(d.Name()))
 		if _, ok := extSet[ext]; !ok {
 			return nil
 		}
