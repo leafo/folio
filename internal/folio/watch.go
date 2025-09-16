@@ -2,27 +2,23 @@ package folio
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
-	"os"
+	"io/fs"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
-	"log/slog"
 )
 
-const watchDebounceInterval = 750 * time.Millisecond
+const watchDebounceInterval = 150 * time.Millisecond
 
-// WatchAndSync monitors the root directory for changes and periodically runs
-// Synchronize after filesystem events settle.
-func WatchAndSync(ctx context.Context, db *sql.DB, root string, opts Options) error {
-	logger := opts.Logger
-	if logger == nil {
-		logger = slog.Default()
-	}
+// WatchAndSync monitors the root directory for changes and incrementally
+// updates the SQLite database when filesystem events settle.
+func (f *Folio) WatchAndSync(ctx context.Context) error {
+	logger := f.loggerOrDefault()
 
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -31,15 +27,17 @@ func WatchAndSync(ctx context.Context, db *sql.DB, root string, opts Options) er
 	defer watcher.Close()
 
 	watched := make(map[string]struct{})
-	if err := addRecursiveWatch(watcher, root, root, watched, logger); err != nil {
+	if err := f.addRecursiveWatch(watcher, f.root, watched); err != nil {
 		return err
 	}
 
-	logger.Info("Watch mode active", "root", root, "debounce", watchDebounceInterval.String())
+	logger.Info("Watch mode active", "root", f.root, "debounce", watchDebounceInterval.String())
 
-	extSet := makeExtensionSet(opts.Extensions)
+	extSet := makeExtensionSet(f.opts.Extensions)
 
 	var debounceTimer *time.Timer
+	changedFiles := make(map[string]struct{})
+	removedDirs := make(map[string]struct{})
 
 	for {
 		var debounceC <-chan time.Time
@@ -55,42 +53,46 @@ func WatchAndSync(ctx context.Context, db *sql.DB, root string, opts Options) er
 			if !ok {
 				return nil
 			}
-			handleWatcherEvent(event, watcher, root, watched, logger, extSet, &debounceTimer)
+			f.handleWatcherEvent(event, watcher, watched, extSet, &debounceTimer, changedFiles, removedDirs)
 		case err, ok := <-watcher.Errors:
-			if !ok {
-				continue
-			}
-			if err == nil {
+			if !ok || err == nil {
 				continue
 			}
 			logger.Error("Watcher error", "error", err)
 		case <-debounceC:
 			stopTimer(&debounceTimer)
-			logger.Info("Filesystem settled; running synchronization")
-			if syncErr := Synchronize(ctx, db, root, opts); syncErr != nil {
-				logger.Error("Synchronization failed during watch", "error", syncErr)
-				if !errors.Is(syncErr, context.Canceled) {
-					continue
-				}
-				return syncErr
+			if len(changedFiles) == 0 && len(removedDirs) == 0 {
+				continue
 			}
-			logger.Info("Synchronization completed for filesystem changes")
+			if syncErr := f.applyIncrementalChanges(ctx, changedFiles, removedDirs); syncErr != nil {
+				logger.Error("Incremental synchronization failed", "error", syncErr)
+				if errors.Is(syncErr, context.Canceled) {
+					return syncErr
+				}
+				continue
+			}
+			changedFiles = make(map[string]struct{})
+			removedDirs = make(map[string]struct{})
 		}
 	}
 }
 
-func handleWatcherEvent(event fsnotify.Event, watcher *fsnotify.Watcher, root string, watched map[string]struct{}, logger *slog.Logger, extSet map[string]struct{}, debounceTimer **time.Timer) {
+func (f *Folio) handleWatcherEvent(event fsnotify.Event, watcher *fsnotify.Watcher, watched map[string]struct{}, extSet map[string]struct{}, debounceTimer **time.Timer, changed map[string]struct{}, removedDirs map[string]struct{}) {
+	logger := f.loggerOrDefault()
+
 	path := filepath.Clean(event.Name)
-	rel := relativePath(root, path)
-	logger.Info("Filesystem event", "op", event.Op.String(), "path", rel)
+	rel := f.relativePath(path)
+	// logger.Info("Filesystem event", "op", event.Op.String(), "path", rel)
 
 	dirChanged := false
 
 	if event.Op&fsnotify.Create != 0 {
-		if info, err := os.Stat(path); err == nil && info.IsDir() {
-			if err := addRecursiveWatch(watcher, root, path, watched, logger); err != nil {
+		info, err := f.fs.Stat(path)
+		if err == nil && info.IsDir() {
+			if err := f.addRecursiveWatch(watcher, path, watched); err != nil {
 				logger.Error("Failed to watch new directory", "path", rel, "error", err)
 			}
+			delete(removedDirs, rel)
 			dirChanged = true
 		}
 	}
@@ -102,6 +104,9 @@ func handleWatcherEvent(event fsnotify.Event, watcher *fsnotify.Watcher, root st
 			}
 			delete(watched, path)
 			logger.Info("Stopped watching directory", "path", rel)
+			if rel != "." {
+				removedDirs[rel] = struct{}{}
+			}
 			dirChanged = true
 		}
 	}
@@ -119,17 +124,24 @@ func handleWatcherEvent(event fsnotify.Event, watcher *fsnotify.Watcher, root st
 		return
 	}
 
-	logger.Info("Queueing synchronization for changed file", "path", rel)
+	changed[rel] = struct{}{}
+	// logger.Info("Queueing synchronization for file", "path", rel, "op", event.Op.String())
+
 	scheduleSync(debounceTimer)
 }
 
-func addRecursiveWatch(watcher *fsnotify.Watcher, root, start string, watched map[string]struct{}, logger *slog.Logger) error {
-	return filepath.WalkDir(start, func(path string, entry os.DirEntry, err error) error {
+func (f *Folio) addRecursiveWatch(watcher *fsnotify.Watcher, start string, watched map[string]struct{}) error {
+	logger := f.loggerOrDefault()
+
+	return f.fs.WalkDir(start, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 		if !entry.IsDir() {
 			return nil
+		}
+		if entry.Name() == ".git" {
+			return fs.SkipDir
 		}
 		clean := filepath.Clean(path)
 		if _, ok := watched[clean]; ok {
@@ -139,9 +151,65 @@ func addRecursiveWatch(watcher *fsnotify.Watcher, root, start string, watched ma
 			return fmt.Errorf("watch directory %s: %w", clean, err)
 		}
 		watched[clean] = struct{}{}
-		logger.Info("Watching directory", "path", relativePath(root, clean))
+		logger.Info("Watching directory", "path", f.relativePath(clean))
 		return nil
 	})
+}
+
+func (f *Folio) applyIncrementalChanges(ctx context.Context, changed, removedDirs map[string]struct{}) error {
+	if len(changed) == 0 && len(removedDirs) == 0 {
+		return nil
+	}
+
+	logger := f.loggerOrDefault()
+
+	changedList := make([]string, 0, len(changed))
+	for rel := range changed {
+		changedList = append(changedList, rel)
+	}
+	sort.Strings(changedList)
+
+	removedDirList := make([]string, 0, len(removedDirs))
+	for rel := range removedDirs {
+		if rel == "." || rel == "" {
+			continue
+		}
+		removedDirList = append(removedDirList, rel)
+	}
+	sort.Strings(removedDirList)
+
+	totals := chunkSyncStats{}
+
+	for _, rel := range changedList {
+		stats, syncErr := f.SyncPath(ctx, rel)
+		if syncErr != nil {
+			return syncErr
+		}
+		totals.inserted += stats.inserted
+		totals.updated += stats.updated
+		totals.deleted += stats.deleted
+	}
+
+	for _, rel := range removedDirList {
+		files, listErr := f.listFilesInDirectory(ctx, rel)
+		if listErr != nil {
+			return listErr
+		}
+		dirDeleted := 0
+		for _, file := range files {
+			stats, syncErr := f.SyncPath(ctx, file)
+			if syncErr != nil {
+				return syncErr
+			}
+			dirDeleted += stats.deleted
+			totals.deleted += stats.deleted
+		}
+		logger.Debug("Removed directory from index", "directory", rel, "files", len(files), "chunks", dirDeleted)
+	}
+
+	logger.Debug("Incremental synchronization summary", "updated_files", len(changedList), "removed_dirs", len(removedDirList), "chunks_inserted", totals.inserted, "chunks_updated", totals.updated, "chunks_deleted", totals.deleted)
+
+	return nil
 }
 
 func makeExtensionSet(exts []string) map[string]struct{} {
@@ -190,12 +258,4 @@ func stopTimer(timer **time.Timer) {
 		}
 	}
 	*timer = nil
-}
-
-func relativePath(root, path string) string {
-	rel, err := filepath.Rel(root, path)
-	if err != nil {
-		return filepath.ToSlash(path)
-	}
-	return filepath.ToSlash(rel)
 }

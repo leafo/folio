@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"crypto/md5"
 	"encoding/hex"
+	"errors"
 	"fmt"
-	"os"
+	"io"
+	"io/fs"
 	"path/filepath"
 	"strings"
 )
@@ -25,39 +27,30 @@ type ChunkOptions struct {
 	ChunkOverlap int
 }
 
-// ChunkFile splits the provided file into overlapping chunks based on the
-// supplied options. The returned chunks use the provided relative path for
-// storage in the database.
-func ChunkFile(absPath, relPath string, opts ChunkOptions) ([]Chunk, error) {
+func (f *Folio) chunkFile(relPath string) ([]Chunk, error) {
+	opts := f.chunkOptions()
 	if opts.ChunkSize <= 0 {
 		return nil, fmt.Errorf("chunk size must be positive")
 	}
 	if opts.ChunkOverlap < 0 {
 		return nil, fmt.Errorf("chunk overlap cannot be negative")
 	}
-
-	// Ensure the overlap never consumes the entire chunk.
 	if opts.ChunkOverlap >= opts.ChunkSize {
 		opts.ChunkOverlap = opts.ChunkSize - 1
 	}
 
-	f, err := os.Open(absPath)
+	absPath := f.absPath(relPath)
+	file, err := f.fs.Open(absPath)
 	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, fs.ErrNotExist
+		}
 		return nil, err
 	}
-	defer f.Close()
+	defer file.Close()
 
-	scanner := bufio.NewScanner(f)
-	// Allocate a slightly larger buffer to support long lines commonly found in
-	// code or configuration files.
-	buf := make([]byte, 64*1024)
-	scanner.Buffer(buf, 1024*1024)
-
-	var lines []string
-	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
-	}
-	if err := scanner.Err(); err != nil {
+	lines, err := readLines(file)
+	if err != nil {
 		return nil, err
 	}
 
@@ -95,4 +88,19 @@ func ChunkFile(absPath, relPath string, opts ChunkOptions) ([]Chunk, error) {
 	}
 
 	return chunks, nil
+}
+
+func readLines(r io.Reader) ([]string, error) {
+	scanner := bufio.NewScanner(r)
+	buf := make([]byte, 64*1024)
+	scanner.Buffer(buf, 1024*1024)
+
+	var lines []string
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return lines, nil
 }

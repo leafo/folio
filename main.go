@@ -30,7 +30,7 @@ func main() {
 	flag.BoolVar(&watchMode, "watch", false, "enable watch mode to process changes continuously")
 	flag.Parse()
 
-	handler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})
+	handler := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})
 	logger := slog.New(handler)
 
 	extList := parseExtensions(extensions)
@@ -73,18 +73,19 @@ func main() {
 		Extensions:   extList,
 		ChunkSize:    chunkSize,
 		ChunkOverlap: chunkOverlap,
-		Logger:       logger,
 	}
 
+	manager := folio.NewFolio(db, root, opts, logger)
+
 	logger.Info("Launching synchronization", "root", root)
-	if err := folio.Synchronize(ctx, db, root, opts); err != nil {
+	if err := manager.Synchronize(ctx); err != nil {
 		logger.Error("Synchronization failed", "error", err)
 		os.Exit(1)
 	}
 
 	if watchMode {
 		logger.Info("Entering watch mode")
-		if err := folio.WatchAndSync(ctx, db, root, opts); err != nil {
+		if err := manager.WatchAndSync(ctx); err != nil {
 			logger.Error("Watch mode terminated", "error", err)
 			os.Exit(1)
 		}

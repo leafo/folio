@@ -4,23 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"path/filepath"
-
-	"log/slog"
+	"sort"
 )
-
-// Options control the behaviour of the synchronisation routine.
-type Options struct {
-	Extensions   []string
-	ChunkSize    int
-	ChunkOverlap int
-	Logger       *slog.Logger
-}
-
-type chunkPosition struct {
-	start int
-	end   int
-}
 
 type chunkSyncStats struct {
 	inserted int
@@ -28,77 +13,58 @@ type chunkSyncStats struct {
 	deleted  int
 }
 
+type chunkPosition struct {
+	start int
+	end   int
+}
+
 // Synchronize scans the root directory, chunks eligible files, and reconciles
 // the results with the SQLite database.
-func Synchronize(ctx context.Context, db *sql.DB, root string, opts Options) error {
-	logger := opts.Logger
-	if logger == nil {
-		logger = slog.Default()
-	}
+func (f *Folio) Synchronize(ctx context.Context) error {
+	logger := f.loggerOrDefault()
 
-	logger.Info("Starting synchronization", "root", root, "extensions", opts.Extensions, "chunk_size", opts.ChunkSize, "chunk_overlap", opts.ChunkOverlap)
-
-	files, err := CollectFiles(root, opts.Extensions)
+	files, err := CollectFiles(f.fs, f.root, f.opts.Extensions)
 	if err != nil {
 		return fmt.Errorf("collect files: %w", err)
 	}
 	logger.Info("Collected files to process", "count", len(files))
 
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin transaction: %w", err)
-	}
-	defer func() {
-		if err != nil {
-			tx.Rollback()
-		}
-	}()
-
-	existingFiles, err := loadExistingFiles(ctx, tx)
+	existingFiles, err := f.loadExistingFiles(ctx)
 	if err != nil {
 		return err
 	}
 
-	chunkOpts := ChunkOptions{ChunkSize: opts.ChunkSize, ChunkOverlap: opts.ChunkOverlap}
+	totals := chunkSyncStats{}
 
 	for _, relPath := range files {
-		absPath := filepath.Join(root, filepath.FromSlash(relPath))
-		chunks, chunkErr := ChunkFile(absPath, relPath, chunkOpts)
-		if chunkErr != nil {
-			err = fmt.Errorf("chunk file %s: %w", relPath, chunkErr)
-			return err
-		}
-
-		stats, syncErr := syncFileChunks(ctx, tx, relPath, chunks)
+		stats, syncErr := f.SyncPath(ctx, relPath)
 		if syncErr != nil {
-			err = fmt.Errorf("sync file %s: %w", relPath, syncErr)
-			return err
+			return fmt.Errorf("sync file %s: %w", relPath, syncErr)
 		}
-
-		logger.Info("Processed file", "file_path", relPath, "chunks", len(chunks), "inserted", stats.inserted, "updated", stats.updated, "deleted", stats.deleted)
+		totals.inserted += stats.inserted
+		totals.updated += stats.updated
+		totals.deleted += stats.deleted
 
 		delete(existingFiles, relPath)
 	}
 
+	removedCount := len(existingFiles)
 	for relPath := range existingFiles {
-		if _, execErr := tx.ExecContext(ctx, `DELETE FROM chunks WHERE file_path = ?`, relPath); execErr != nil {
-			err = fmt.Errorf("delete removed file entries for %s: %w", relPath, execErr)
-			return err
+		stats, syncErr := f.SyncPath(ctx, relPath)
+		if syncErr != nil {
+			return fmt.Errorf("sync file %s: %w", relPath, syncErr)
 		}
-		logger.Info("Removed chunks for missing file", "file_path", relPath)
+		totals.deleted += stats.deleted
+		delete(existingFiles, relPath)
 	}
 
-	if commitErr := tx.Commit(); commitErr != nil {
-		return fmt.Errorf("commit transaction: %w", commitErr)
-	}
-
-	logger.Info("Synchronization complete", "processed_files", len(files), "removed_files", len(existingFiles))
+	logger.Info("Synchronization complete", "processed_files", len(files), "removed_files", removedCount, "chunks_inserted", totals.inserted, "chunks_updated", totals.updated, "chunks_deleted", totals.deleted)
 
 	return nil
 }
 
-func loadExistingFiles(ctx context.Context, tx *sql.Tx) (map[string]struct{}, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT file_path FROM chunks`)
+func (f *Folio) loadExistingFiles(ctx context.Context) (map[string]struct{}, error) {
+	rows, err := f.db.QueryContext(ctx, `SELECT DISTINCT file_path FROM chunks`)
 	if err != nil {
 		return nil, fmt.Errorf("load existing files: %w", err)
 	}
@@ -119,7 +85,7 @@ func loadExistingFiles(ctx context.Context, tx *sql.Tx) (map[string]struct{}, er
 	return existing, nil
 }
 
-func syncFileChunks(ctx context.Context, tx *sql.Tx, filePath string, chunks []Chunk) (chunkSyncStats, error) {
+func (f *Folio) syncFileChunks(ctx context.Context, tx *sql.Tx, filePath string, chunks []Chunk) (chunkSyncStats, error) {
 	existing, err := loadExistingChunks(ctx, tx, filePath)
 	if err != nil {
 		return chunkSyncStats{}, err
@@ -169,6 +135,18 @@ VALUES (?, ?, ?, ?, ?)
 	return stats, nil
 }
 
+func (f *Folio) deleteFileRecords(ctx context.Context, tx *sql.Tx, filePath string) (int, error) {
+	res, err := tx.ExecContext(ctx, `DELETE FROM chunks WHERE file_path = ?`, filePath)
+	if err != nil {
+		return 0, fmt.Errorf("delete file %s: %w", filePath, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("rows affected for %s: %w", filePath, err)
+	}
+	return int(affected), nil
+}
+
 func loadExistingChunks(ctx context.Context, tx *sql.Tx, filePath string) (map[chunkPosition]string, error) {
 	rows, err := tx.QueryContext(ctx, `
 SELECT start_line, end_line, content_hash
@@ -194,4 +172,33 @@ WHERE file_path = ?
 	}
 
 	return existing, nil
+}
+
+func (f *Folio) listFilesInDirectory(ctx context.Context, relDir string) ([]string, error) {
+	if relDir == "" || relDir == "." {
+		return nil, nil
+	}
+
+	pattern := relDir + "/%"
+
+	rows, err := f.db.QueryContext(ctx, `SELECT DISTINCT file_path FROM chunks WHERE file_path LIKE ?`, pattern)
+	if err != nil {
+		return nil, fmt.Errorf("list directory %s: %w", relDir, err)
+	}
+	defer rows.Close()
+
+	var files []string
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			return nil, fmt.Errorf("scan directory file: %w", err)
+		}
+		files = append(files, path)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate directory files: %w", err)
+	}
+
+	sort.Strings(files)
+	return files, nil
 }
