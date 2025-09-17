@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -13,7 +15,16 @@ import (
 	"github.com/leafo/folio/internal/folio"
 )
 
+const configFileName = "folio.json"
+
 func main() {
+	cfg := defaultConfig()
+	configLoaded, err := loadConfigFile(configFileName, &cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to load %s: %v\n", configFileName, err)
+		os.Exit(1)
+	}
+
 	var (
 		root         string
 		dbPath       string
@@ -23,23 +34,34 @@ func main() {
 		watchMode    bool
 		showFile     string
 		listFiles    bool
+		writeConfig  bool
 	)
 
-	flag.StringVar(&root, "root", ".", "root directory to scan")
-	flag.StringVar(&dbPath, "db", "folio.db", "path to the SQLite database file")
-	flag.IntVar(&chunkSize, "chunk-size", 200, "number of lines per chunk")
-	flag.IntVar(&chunkOverlap, "chunk-overlap", 20, "number of overlapping lines between consecutive chunks")
-	flag.StringVar(&extensions, "extensions", ".txt,.md,.rst,.go,.py,.js,.ts,.tsx,.json,.yaml,.yml,.toml", "comma separated list of file extensions to include")
+	defaultExtensions := strings.Join(cfg.Extensions, ",")
+
+	flag.StringVar(&root, "root", cfg.Root, "root directory to scan")
+	flag.StringVar(&dbPath, "db", cfg.DBPath, "path to the SQLite database file")
+	flag.IntVar(&chunkSize, "chunk-size", cfg.ChunkSize, "number of lines per chunk")
+	flag.IntVar(&chunkOverlap, "chunk-overlap", cfg.ChunkOverlap, "number of overlapping lines between consecutive chunks")
+	flag.StringVar(&extensions, "extensions", defaultExtensions, "comma separated list of file extensions to include")
 	flag.BoolVar(&watchMode, "watch", false, "enable watch mode to process changes continuously")
 	flag.StringVar(&showFile, "show-file", "", "show stored chunks for the given file and exit")
 	flag.BoolVar(&listFiles, "list", false, "list tracked files and exit")
+	flag.BoolVar(&writeConfig, "write-config", false, "write configuration to folio.json and exit")
 	flag.Parse()
 
 	handler := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})
 	logger := slog.New(handler)
+	if configLoaded {
+		logger.Info("Loaded configuration file", "path", configFileName)
+	}
 
 	if showFile != "" && listFiles {
 		logger.Error("Cannot use --show-file and --list at the same time")
+		os.Exit(1)
+	}
+	if writeConfig && (showFile != "" || listFiles) {
+		logger.Error("Cannot combine --write-config with --show-file or --list")
 		os.Exit(1)
 	}
 
@@ -49,66 +71,75 @@ func main() {
 		os.Exit(1)
 	}
 
-	absRoot, err := filepath.Abs(root)
-	if err != nil {
-		logger.Error("Failed to resolve root", "root", root, "error", err)
+	cfg.Root = root
+	cfg.DBPath = dbPath
+	cfg.ChunkSize = chunkSize
+	cfg.ChunkOverlap = chunkOverlap
+	cfg.Extensions = extList
+
+	if cfg.ChunkSize <= 0 {
+		logger.Error("Chunk size must be positive", "chunk_size", cfg.ChunkSize)
 		os.Exit(1)
 	}
-	root = absRoot
+	if cfg.ChunkOverlap < 0 {
+		logger.Error("Chunk overlap cannot be negative", "chunk_overlap", cfg.ChunkOverlap)
+		os.Exit(1)
+	}
+	if cfg.ChunkOverlap >= cfg.ChunkSize {
+		logger.Warn("Chunk overlap exceeds chunk size; adjusting", "requested_overlap", cfg.ChunkOverlap, "chunk_size", cfg.ChunkSize, "adjusted_overlap", cfg.ChunkSize-1)
+		cfg.ChunkOverlap = cfg.ChunkSize - 1
+	}
+
+	absRoot, err := filepath.Abs(cfg.Root)
+	if err != nil {
+		logger.Error("Failed to resolve root", "root", cfg.Root, "error", err)
+		os.Exit(1)
+	}
+	rootAbs := absRoot
 
 	if showFile != "" {
 		absShow := showFile
 		if !filepath.IsAbs(absShow) {
-			absShow = filepath.Join(root, showFile)
+			absShow = filepath.Join(rootAbs, showFile)
 		}
 		absShow, err = filepath.Abs(absShow)
 		if err != nil {
 			logger.Error("Failed to resolve show file path", "file", showFile, "error", err)
 			os.Exit(1)
 		}
-		rel, relErr := filepath.Rel(root, absShow)
+		rel, relErr := filepath.Rel(rootAbs, absShow)
 		if relErr != nil {
 			logger.Error("Failed to compute relative path for show file", "file", showFile, "error", relErr)
 			os.Exit(1)
 		}
 		relSlash := filepath.ToSlash(rel)
 		if relSlash == ".." || strings.HasPrefix(relSlash, "../") {
-			logger.Error("Show file must be within the root directory", "file", showFile, "root", root)
+			logger.Error("Show file must be within the root directory", "file", showFile, "root", rootAbs)
 			os.Exit(1)
 		}
 		showFile = relSlash
 	}
 
-	if chunkSize <= 0 {
-		logger.Error("Chunk size must be positive", "chunk_size", chunkSize)
-		os.Exit(1)
-	}
-	if chunkOverlap < 0 {
-		logger.Error("Chunk overlap cannot be negative", "chunk_overlap", chunkOverlap)
-		os.Exit(1)
-	}
-	if chunkOverlap >= chunkSize {
-		logger.Warn("Chunk overlap exceeds chunk size; adjusting", "requested_overlap", chunkOverlap, "chunk_size", chunkSize, "adjusted_overlap", chunkSize-1)
-		chunkOverlap = chunkSize - 1
-	}
-
 	ctx := context.Background()
 
-	db, err := folio.OpenDatabase(ctx, dbPath)
+	if writeConfig {
+		if err := writeConfigFile(configFileName, cfg); err != nil {
+			logger.Error("Failed to write configuration", "error", err)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stdout, "wrote configuration to %s\n", configFileName)
+		return
+	}
+
+	db, err := folio.OpenDatabase(ctx, cfg.DBPath)
 	if err != nil {
 		logger.Error("Failed to open database", "error", err)
 		os.Exit(1)
 	}
 	defer db.Close()
-	logger.Info("Opened database", "path", dbPath)
+	logger.Info("Opened database", "path", cfg.DBPath)
 
-	opts := folio.Options{
-		Extensions:   extList,
-		ChunkSize:    chunkSize,
-		ChunkOverlap: chunkOverlap,
-	}
-
-	manager := folio.NewFolio(db, root, opts, logger)
+	manager := folio.NewFolio(db, rootAbs, cfg.Options(), logger)
 
 	if listFiles {
 		if err := renderStoredFiles(ctx, manager); err != nil {
@@ -126,7 +157,7 @@ func main() {
 		return
 	}
 
-	logger.Info("Launching synchronization", "root", root)
+	logger.Info("Launching synchronization", "root", rootAbs)
 	summary, err := manager.Synchronize(ctx)
 	if err != nil {
 		logger.Error("Synchronization failed", "error", err)
@@ -141,10 +172,7 @@ func main() {
 			logger.Error("Watch mode terminated", "error", err)
 			os.Exit(1)
 		}
-		return
 	}
-
-	fmt.Fprintln(os.Stdout, "synchronization complete")
 }
 
 func parseExtensions(raw string) []string {
@@ -218,4 +246,39 @@ func printSummary(summary folio.SyncSummary) {
 	fmt.Fprintf(os.Stdout, "chunks inserted: %d\n", summary.ChunksInserted)
 	fmt.Fprintf(os.Stdout, "chunks updated: %d\n", summary.ChunksUpdated)
 	fmt.Fprintf(os.Stdout, "chunks deleted: %d\n", summary.ChunksDeleted)
+}
+
+func defaultConfig() folio.Config {
+	return folio.Config{
+		Root:         ".",
+		DBPath:       "folio.db",
+		Extensions:   []string{".txt", ".md", ".rst", ".go", ".py", ".js", ".ts", ".tsx", ".json", ".yaml", ".yml", ".toml"},
+		ChunkSize:    200,
+		ChunkOverlap: 20,
+	}
+}
+
+func loadConfigFile(path string, cfg *folio.Config) (bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("read config: %w", err)
+	}
+	if err := json.Unmarshal(data, cfg); err != nil {
+		return false, fmt.Errorf("parse config: %w", err)
+	}
+	return true, nil
+}
+
+func writeConfigFile(path string, cfg folio.Config) error {
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal config: %w", err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return fmt.Errorf("write config: %w", err)
+	}
+	return nil
 }
