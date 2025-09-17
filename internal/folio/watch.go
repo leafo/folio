@@ -89,6 +89,9 @@ func (f *Folio) handleWatcherEvent(event fsnotify.Event, watcher *fsnotify.Watch
 	if event.Op&fsnotify.Create != 0 {
 		info, err := f.fs.Stat(path)
 		if err == nil && info.IsDir() {
+			if f.isIgnored(rel) {
+				return
+			}
 			if err := f.addRecursiveWatch(watcher, path, watched); err != nil {
 				logger.Error("Failed to watch new directory", "path", rel, "error", err)
 			}
@@ -120,6 +123,10 @@ func (f *Folio) handleWatcherEvent(event fsnotify.Event, watcher *fsnotify.Watch
 		return
 	}
 
+	if f.isIgnored(rel) {
+		return
+	}
+
 	if !isRelevantFile(path, extSet) {
 		return
 	}
@@ -140,10 +147,11 @@ func (f *Folio) addRecursiveWatch(watcher *fsnotify.Watcher, start string, watch
 		if !entry.IsDir() {
 			return nil
 		}
-		if entry.Name() == ".git" {
+		clean := filepath.Clean(path)
+		rel := f.relativePath(clean)
+		if f.isIgnored(rel) {
 			return fs.SkipDir
 		}
-		clean := filepath.Clean(path)
 		if _, ok := watched[clean]; ok {
 			return nil
 		}
@@ -151,7 +159,7 @@ func (f *Folio) addRecursiveWatch(watcher *fsnotify.Watcher, start string, watch
 			return fmt.Errorf("watch directory %s: %w", clean, err)
 		}
 		watched[clean] = struct{}{}
-		logger.Info("Watching directory", "path", f.relativePath(clean))
+		logger.Info("Watching directory", "path", rel)
 		return nil
 	})
 }

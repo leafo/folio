@@ -37,7 +37,7 @@ type SyncSummary struct {
 func (f *Folio) Synchronize(ctx context.Context) (SyncSummary, error) {
 	logger := f.loggerOrDefault()
 
-	files, err := CollectFiles(f.fs, f.root, f.opts.Extensions)
+	files, err := CollectFiles(f.fs, f.root, f.opts.Extensions, f.opts.IgnoreDirs)
 	if err != nil {
 		return SyncSummary{}, fmt.Errorf("collect files: %w", err)
 	}
@@ -61,7 +61,7 @@ func (f *Folio) Synchronize(ctx context.Context) (SyncSummary, error) {
 		workerCount = 1
 	}
 
-	runBatch := func(paths []string, removeFromExisting bool) error {
+	runPaths := func(paths []string, handler func(string) error) error {
 		if len(paths) == 0 {
 			return nil
 		}
@@ -101,20 +101,9 @@ func (f *Folio) Synchronize(ctx context.Context) (SyncSummary, error) {
 				defer wg.Done()
 				defer func() { <-sem }()
 
-				stats, syncErr := f.SyncPath(ctx, rel)
-				if syncErr != nil {
-					setFirstErr(fmt.Errorf("sync file %s: %w", rel, syncErr))
+				if err := handler(rel); err != nil {
+					setFirstErr(err)
 					return
-				}
-
-				inserted.Add(int64(stats.inserted))
-				updated.Add(int64(stats.updated))
-				deleted.Add(int64(stats.deleted))
-
-				if removeFromExisting {
-					existingMu.Lock()
-					delete(existingFiles, rel)
-					existingMu.Unlock()
 				}
 			}(relPath)
 		}
@@ -126,7 +115,22 @@ func (f *Folio) Synchronize(ctx context.Context) (SyncSummary, error) {
 		return firstErr
 	}
 
-	if err := runBatch(files, true); err != nil {
+	if err := runPaths(files, func(rel string) error {
+		stats, syncErr := f.SyncPath(ctx, rel)
+		if syncErr != nil {
+			return fmt.Errorf("sync file %s: %w", rel, syncErr)
+		}
+
+		inserted.Add(int64(stats.inserted))
+		updated.Add(int64(stats.updated))
+		deleted.Add(int64(stats.deleted))
+
+		existingMu.Lock()
+		delete(existingFiles, rel)
+		existingMu.Unlock()
+
+		return nil
+	}); err != nil {
 		return SyncSummary{}, err
 	}
 
@@ -138,7 +142,16 @@ func (f *Folio) Synchronize(ctx context.Context) (SyncSummary, error) {
 	existingMu.Unlock()
 	summary.FilesRemoved = len(remaining)
 
-	if err := runBatch(remaining, false); err != nil {
+	if err := runPaths(remaining, func(rel string) error {
+		stats, syncErr := f.SyncPath(ctx, rel)
+		if syncErr != nil {
+			return fmt.Errorf("sync file %s: %w", rel, syncErr)
+		}
+		inserted.Add(int64(stats.inserted))
+		updated.Add(int64(stats.updated))
+		deleted.Add(int64(stats.deleted))
+		return nil
+	}); err != nil {
 		return SyncSummary{}, err
 	}
 
@@ -177,7 +190,7 @@ func (f *Folio) loadExistingFiles(ctx context.Context) (map[string]struct{}, err
 		return nil, fmt.Errorf("iterate existing files: %w", err)
 	}
 
-	return existing, nil
+return existing, nil
 }
 
 func (f *Folio) countStoredStats(ctx context.Context) (int, int, error) {

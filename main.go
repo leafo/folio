@@ -24,26 +24,30 @@ func main() {
 		fmt.Fprintf(os.Stderr, "failed to load %s: %v\n", configFileName, err)
 		os.Exit(1)
 	}
+	cfg.IgnoreDirs = normalizeIgnoreDirs(cfg.IgnoreDirs)
 
 	var (
-		root         string
-		dbPath       string
-		chunkSize    int
-		chunkOverlap int
-		extensions   string
-		watchMode    bool
-		showFile     string
-		listFiles    bool
-		writeConfig  bool
+		root              string
+		dbPath            string
+		chunkSize         int
+		chunkOverlap      int
+		extensions        string
+		watchMode         bool
+		showFile          string
+		listFiles         bool
+		writeConfig       bool
+		ignoreDirectories string
 	)
 
 	defaultExtensions := strings.Join(cfg.Extensions, ",")
+	defaultIgnore := strings.Join(cfg.IgnoreDirs, ",")
 
 	flag.StringVar(&root, "root", cfg.Root, "root directory to scan")
 	flag.StringVar(&dbPath, "db", cfg.DBPath, "path to the SQLite database file")
 	flag.IntVar(&chunkSize, "chunk-size", cfg.ChunkSize, "number of lines per chunk")
 	flag.IntVar(&chunkOverlap, "chunk-overlap", cfg.ChunkOverlap, "number of overlapping lines between consecutive chunks")
 	flag.StringVar(&extensions, "extensions", defaultExtensions, "comma separated list of file extensions to include")
+	flag.StringVar(&ignoreDirectories, "ignore-directories", defaultIgnore, "comma separated list of directories to ignore")
 	flag.BoolVar(&watchMode, "watch", false, "enable watch mode to process changes continuously")
 	flag.StringVar(&showFile, "show-file", "", "show stored chunks for the given file and exit")
 	flag.BoolVar(&listFiles, "list", false, "list tracked files and exit")
@@ -70,6 +74,9 @@ func main() {
 		logger.Error("No extensions provided")
 		os.Exit(1)
 	}
+
+	ignoreList := normalizeIgnoreDirs(parseList(ignoreDirectories))
+	cfg.IgnoreDirs = ignoreList
 
 	cfg.Root = root
 	cfg.DBPath = dbPath
@@ -255,6 +262,7 @@ func defaultConfig() folio.Config {
 		Extensions:   []string{".txt", ".md", ".rst", ".go", ".py", ".js", ".ts", ".tsx", ".json", ".yaml", ".yml", ".toml"},
 		ChunkSize:    200,
 		ChunkOverlap: 20,
+		IgnoreDirs:   []string{".git", "node_modules"},
 	}
 }
 
@@ -281,4 +289,41 @@ func writeConfigFile(path string, cfg folio.Config) error {
 		return fmt.Errorf("write config: %w", err)
 	}
 	return nil
+}
+
+func parseList(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	var result []string
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed == "" {
+			continue
+		}
+		result = append(result, trimmed)
+	}
+	return result
+}
+
+func normalizeIgnoreDirs(dirs []string) []string {
+	if len(dirs) == 0 {
+		return nil
+	}
+	norm := make([]string, 0, len(dirs))
+	seen := make(map[string]struct{})
+	for _, d := range dirs {
+		clean := strings.Trim(strings.TrimSpace(d), "/")
+		clean = filepath.ToSlash(clean)
+		if clean == "" {
+			continue
+		}
+		if _, ok := seen[clean]; ok {
+			continue
+		}
+		seen[clean] = struct{}{}
+		norm = append(norm, clean)
+	}
+	return norm
 }

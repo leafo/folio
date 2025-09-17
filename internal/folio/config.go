@@ -7,6 +7,7 @@ type Config struct {
 	Extensions   []string `json:"extensions"`
 	ChunkSize    int      `json:"chunk_size"`
 	ChunkOverlap int      `json:"chunk_overlap"`
+	IgnoreDirs   []string `json:"ignore_directories"`
 }
 
 // Options converts the configuration into the Folio options used by the manager.
@@ -15,5 +16,6 @@ func (c Config) Options() Options {
 		Extensions:   append([]string(nil), c.Extensions...),
 		ChunkSize:    c.ChunkSize,
 		ChunkOverlap: c.ChunkOverlap,
+		IgnoreDirs:   append([]string(nil), c.IgnoreDirs...),
 	}
 }
