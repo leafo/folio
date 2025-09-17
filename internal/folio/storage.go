@@ -51,6 +51,12 @@ CREATE TABLE IF NOT EXISTS chunks (
     PRIMARY KEY (file_path, start_line, end_line)
 );
 CREATE INDEX IF NOT EXISTS idx_chunks_file_path ON chunks(file_path);
+CREATE TABLE IF NOT EXISTS file_metadata (
+    file_path TEXT PRIMARY KEY,
+    size INTEGER NOT NULL,
+    mtime_ns INTEGER NOT NULL,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 `
 
 	if _, err := db.ExecContext(ctx, schema); err != nil {

@@ -27,6 +27,7 @@ type Folio struct {
 	opts   Options
 	logger *slog.Logger
 	fs     FileSystem
+	force  bool
 }
 
 // NewFolio constructs a Folio instance using the provided database connection and configuration.
@@ -41,6 +42,7 @@ func NewFolio(db *sql.DB, root string, opts Options, logger *slog.Logger) *Folio
 		opts:   opts,
 		logger: logger,
 		fs:     OSFileSystem{},
+		force:  false,
 	}
 	return f
 }
@@ -52,6 +54,11 @@ func (f *Folio) SetFileSystem(fs FileSystem) {
 		return
 	}
 	f.fs = fs
+}
+
+// SetForceProcessing toggles whether SyncPath should bypass metadata shortcuts.
+func (f *Folio) SetForceProcessing(force bool) {
+	f.force = force
 }
 
 func (f *Folio) chunkOptions() ChunkOptions {
@@ -75,20 +82,7 @@ func (f *Folio) shouldIndex(relPath string) bool {
 }
 
 func (f *Folio) isIgnored(relPath string) bool {
-	if len(f.opts.IgnoreDirs) == 0 {
-		return false
-	}
-	relPath = strings.TrimLeft(filepath.ToSlash(relPath), "/")
-	for _, dir := range f.opts.IgnoreDirs {
-		d := strings.Trim(strings.TrimSpace(dir), "/")
-		if d == "" {
-			continue
-		}
-		if relPath == d || strings.HasPrefix(relPath, d+"/") {
-			return true
-		}
-	}
-	return false
+	return pathMatchesIgnore(relPath, f.opts.IgnoreDirs)
 }
 
 func (f *Folio) absPath(relPath string) string {
@@ -142,6 +136,31 @@ func (f *Folio) SyncPath(ctx context.Context, relPath string) (chunkSyncStats, e
 func (f *Folio) syncPathTx(ctx context.Context, tx *sql.Tx, relPath string) (chunkSyncStats, error) {
 	logger := f.loggerOrDefault()
 
+	absPath := f.absPath(relPath)
+	info, statErr := f.fs.Stat(absPath)
+	if statErr != nil {
+		if errors.Is(statErr, fs.ErrNotExist) {
+			deleted, delErr := f.deleteFileRecords(ctx, tx, relPath)
+			if delErr != nil {
+				return chunkSyncStats{}, delErr
+			}
+			logger.Info("Removed file from index", "file_path", relPath, "deleted", deleted)
+			return chunkSyncStats{deleted: deleted}, nil
+		}
+		return chunkSyncStats{}, fmt.Errorf("stat file %s: %w", relPath, statErr)
+	}
+
+	currentMeta := fileMetadata{size: info.Size(), mtimeNS: info.ModTime().UnixNano()}
+	if !f.force {
+		storedMeta, ok, err := f.loadFileMetadata(ctx, tx, relPath)
+		if err != nil {
+			return chunkSyncStats{}, err
+		}
+		if ok && storedMeta.size == currentMeta.size && storedMeta.mtimeNS == currentMeta.mtimeNS {
+			return chunkSyncStats{}, nil
+		}
+	}
+
 	chunks, err := f.chunkFile(relPath)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -158,6 +177,9 @@ func (f *Folio) syncPathTx(ctx context.Context, tx *sql.Tx, relPath string) (chu
 	if err != nil {
 		return chunkSyncStats{}, err
 	}
+	if err := f.upsertFileMetadata(ctx, tx, relPath, currentMeta); err != nil {
+		return chunkSyncStats{}, err
+	}
 	logger.Info("Synced file", "file_path", relPath, "chunks", len(chunks), "inserted", stats.inserted, "updated", stats.updated, "deleted", stats.deleted)
 	return stats, nil
 }
@@ -167,4 +189,35 @@ func (f *Folio) loggerOrDefault() *slog.Logger {
 		return f.logger
 	}
 	return slog.Default()
+}
+
+func pathMatchesIgnore(relPath string, ignore []string) bool {
+	if len(ignore) == 0 {
+		return false
+	}
+	rel := strings.TrimLeft(filepath.ToSlash(relPath), "/")
+	if rel == "." {
+		rel = ""
+	}
+	var relWithSlash string
+	if rel == "" {
+		relWithSlash = "/"
+	} else {
+		relWithSlash = "/" + rel + "/"
+	}
+	for _, raw := range ignore {
+		entry := strings.Trim(strings.TrimSpace(raw), "/")
+		if entry == "" {
+			continue
+		}
+		entry = filepath.ToSlash(entry)
+		entrySlash := "/" + entry + "/"
+		if rel == entry || strings.HasPrefix(rel, entry+"/") {
+			return true
+		}
+		if strings.Contains(relWithSlash, entrySlash) {
+			return true
+		}
+	}
+	return false
 }

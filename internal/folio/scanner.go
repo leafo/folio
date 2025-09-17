@@ -30,15 +30,6 @@ func CollectFiles(filesystem FileSystem, root string, extensions, ignoreDirs []s
 		return nil, nil
 	}
 
-	ignoreSet := make(map[string]struct{}, len(ignoreDirs))
-	for _, dir := range ignoreDirs {
-		clean := strings.Trim(strings.TrimSpace(dir), "/")
-		if clean == "" {
-			continue
-		}
-		ignoreSet[filepath.ToSlash(clean)] = struct{}{}
-	}
-
 	var files []string
 	err := filesystem.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -49,11 +40,8 @@ func CollectFiles(filesystem FileSystem, root string, extensions, ignoreDirs []s
 			if relErr != nil {
 				return relErr
 			}
-			relSlash := filepath.ToSlash(strings.Trim(relDir, "/"))
-			if relSlash != "" {
-				if _, ok := ignoreSet[relSlash]; ok {
-					return fs.SkipDir
-				}
+			if pathMatchesIgnore(relDir, ignoreDirs) {
+				return fs.SkipDir
 			}
 			return nil
 		}
@@ -64,6 +52,9 @@ func CollectFiles(filesystem FileSystem, root string, extensions, ignoreDirs []s
 		rel, err := filepath.Rel(root, path)
 		if err != nil {
 			return err
+		}
+		if pathMatchesIgnore(rel, ignoreDirs) {
+			return nil
 		}
 		files = append(files, filepath.ToSlash(rel))
 		return nil

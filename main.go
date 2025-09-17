@@ -37,6 +37,7 @@ func main() {
 		listFiles         bool
 		writeConfig       bool
 		ignoreDirectories string
+		force             bool
 	)
 
 	defaultExtensions := strings.Join(cfg.Extensions, ",")
@@ -52,6 +53,7 @@ func main() {
 	flag.StringVar(&showFile, "show-file", "", "show stored chunks for the given file and exit")
 	flag.BoolVar(&listFiles, "list", false, "list tracked files and exit")
 	flag.BoolVar(&writeConfig, "write-config", false, "write configuration to folio.json and exit")
+	flag.BoolVar(&force, "force", false, "force reprocessing of all files during synchronization")
 	flag.Parse()
 
 	handler := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})
@@ -147,6 +149,7 @@ func main() {
 	logger.Info("Opened database", "path", cfg.DBPath)
 
 	manager := folio.NewFolio(db, rootAbs, cfg.Options(), logger)
+	manager.SetForceProcessing(force)
 
 	if listFiles {
 		if err := renderStoredFiles(ctx, manager); err != nil {
@@ -262,7 +265,7 @@ func defaultConfig() folio.Config {
 		Extensions:   []string{".txt", ".md", ".rst", ".go", ".py", ".js", ".ts", ".tsx", ".json", ".yaml", ".yml", ".toml"},
 		ChunkSize:    200,
 		ChunkOverlap: 20,
-		IgnoreDirs:   []string{".git", "node_modules"},
+		IgnoreDirs:   []string{".git"},
 	}
 }
 

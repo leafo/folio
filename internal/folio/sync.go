@@ -21,6 +21,11 @@ type chunkPosition struct {
 	end   int
 }
 
+type fileMetadata struct {
+	size    int64
+	mtimeNS int64
+}
+
 // SyncSummary captures aggregate details about a synchronization run.
 type SyncSummary struct {
 	FilesProcessed int
@@ -190,7 +195,7 @@ func (f *Folio) loadExistingFiles(ctx context.Context) (map[string]struct{}, err
 		return nil, fmt.Errorf("iterate existing files: %w", err)
 	}
 
-return existing, nil
+	return existing, nil
 }
 
 func (f *Folio) countStoredStats(ctx context.Context) (int, int, error) {
@@ -263,7 +268,37 @@ func (f *Folio) deleteFileRecords(ctx context.Context, tx *sql.Tx, filePath stri
 	if err != nil {
 		return 0, fmt.Errorf("rows affected for %s: %w", filePath, err)
 	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM file_metadata WHERE file_path = ?`, filePath); err != nil {
+		return 0, fmt.Errorf("delete metadata %s: %w", filePath, err)
+	}
 	return int(affected), nil
+}
+
+func (f *Folio) loadFileMetadata(ctx context.Context, tx *sql.Tx, filePath string) (fileMetadata, bool, error) {
+	row := tx.QueryRowContext(ctx, `SELECT size, mtime_ns FROM file_metadata WHERE file_path = ?`, filePath)
+	var meta fileMetadata
+	switch err := row.Scan(&meta.size, &meta.mtimeNS); err {
+	case nil:
+		return meta, true, nil
+	case sql.ErrNoRows:
+		return fileMetadata{}, false, nil
+	default:
+		return fileMetadata{}, false, fmt.Errorf("load file metadata %s: %w", filePath, err)
+	}
+}
+
+func (f *Folio) upsertFileMetadata(ctx context.Context, tx *sql.Tx, filePath string, meta fileMetadata) error {
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO file_metadata (file_path, size, mtime_ns, updated_at)
+VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+ON CONFLICT(file_path) DO UPDATE
+SET size = excluded.size,
+    mtime_ns = excluded.mtime_ns,
+    updated_at = CURRENT_TIMESTAMP
+`, filePath, meta.size, meta.mtimeNS); err != nil {
+		return fmt.Errorf("upsert file metadata %s: %w", filePath, err)
+	}
+	return nil
 }
 
 func loadExistingChunks(ctx context.Context, tx *sql.Tx, filePath string) (map[chunkPosition]string, error) {
