@@ -4,7 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"runtime"
 	"sort"
+	"sync"
+	"sync/atomic"
 )
 
 type chunkSyncStats struct {
@@ -18,8 +21,6 @@ type chunkPosition struct {
 	end   int
 }
 
-// Synchronize scans the root directory, chunks eligible files, and reconciles
-// the results with the SQLite database.
 // SyncSummary captures aggregate details about a synchronization run.
 type SyncSummary struct {
 	FilesProcessed int
@@ -31,6 +32,8 @@ type SyncSummary struct {
 	TotalChunks    int
 }
 
+// Synchronize scans the root directory, chunks eligible files, and reconciles
+// the results with the SQLite database.
 func (f *Folio) Synchronize(ctx context.Context) (SyncSummary, error) {
 	logger := f.loggerOrDefault()
 
@@ -45,37 +48,105 @@ func (f *Folio) Synchronize(ctx context.Context) (SyncSummary, error) {
 		return SyncSummary{}, err
 	}
 
-	totals := chunkSyncStats{}
 	summary := SyncSummary{}
 	summary.FilesProcessed = len(files)
 
-	for _, relPath := range files {
-		stats, syncErr := f.SyncPath(ctx, relPath)
-		if syncErr != nil {
-			return SyncSummary{}, fmt.Errorf("sync file %s: %w", relPath, syncErr)
-		}
-		totals.inserted += stats.inserted
-		totals.updated += stats.updated
-		totals.deleted += stats.deleted
+	var existingMu sync.Mutex
+	var inserted atomic.Int64
+	var updated atomic.Int64
+	var deleted atomic.Int64
 
-		delete(existingFiles, relPath)
+	workerCount := runtime.NumCPU()
+	if workerCount < 1 {
+		workerCount = 1
 	}
 
-	removedCount := len(existingFiles)
-	for relPath := range existingFiles {
-		stats, syncErr := f.SyncPath(ctx, relPath)
-		if syncErr != nil {
-			return SyncSummary{}, fmt.Errorf("sync file %s: %w", relPath, syncErr)
+	runBatch := func(paths []string, removeFromExisting bool) error {
+		if len(paths) == 0 {
+			return nil
 		}
-		totals.deleted += stats.deleted
-		delete(existingFiles, relPath)
-	}
-	summary.FilesRemoved = removedCount
-	summary.ChunksInserted = totals.inserted
-	summary.ChunksUpdated = totals.updated
-	summary.ChunksDeleted = totals.deleted
 
-	logger.Info("Synchronization complete", "processed_files", len(files), "removed_files", removedCount, "chunks_inserted", totals.inserted, "chunks_updated", totals.updated, "chunks_deleted", totals.deleted)
+		sem := make(chan struct{}, workerCount)
+		var wg sync.WaitGroup
+		var firstErr error
+		var errMu sync.Mutex
+
+		setFirstErr := func(err error) {
+			if err == nil {
+				return
+			}
+			errMu.Lock()
+			if firstErr == nil {
+				firstErr = err
+			}
+			errMu.Unlock()
+		}
+
+		for _, relPath := range paths {
+			errMu.Lock()
+			if firstErr != nil {
+				errMu.Unlock()
+				break
+			}
+			errMu.Unlock()
+
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				setFirstErr(ctxErr)
+				break
+			}
+
+			sem <- struct{}{}
+			wg.Add(1)
+			go func(rel string) {
+				defer wg.Done()
+				defer func() { <-sem }()
+
+				stats, syncErr := f.SyncPath(ctx, rel)
+				if syncErr != nil {
+					setFirstErr(fmt.Errorf("sync file %s: %w", rel, syncErr))
+					return
+				}
+
+				inserted.Add(int64(stats.inserted))
+				updated.Add(int64(stats.updated))
+				deleted.Add(int64(stats.deleted))
+
+				if removeFromExisting {
+					existingMu.Lock()
+					delete(existingFiles, rel)
+					existingMu.Unlock()
+				}
+			}(relPath)
+		}
+
+		wg.Wait()
+
+		errMu.Lock()
+		defer errMu.Unlock()
+		return firstErr
+	}
+
+	if err := runBatch(files, true); err != nil {
+		return SyncSummary{}, err
+	}
+
+	existingMu.Lock()
+	remaining := make([]string, 0, len(existingFiles))
+	for rel := range existingFiles {
+		remaining = append(remaining, rel)
+	}
+	existingMu.Unlock()
+	summary.FilesRemoved = len(remaining)
+
+	if err := runBatch(remaining, false); err != nil {
+		return SyncSummary{}, err
+	}
+
+	summary.ChunksInserted = int(inserted.Load())
+	summary.ChunksUpdated = int(updated.Load())
+	summary.ChunksDeleted = int(deleted.Load())
+
+	logger.Info("Synchronization complete", "processed_files", len(files), "removed_files", summary.FilesRemoved, "chunks_inserted", summary.ChunksInserted, "chunks_updated", summary.ChunksUpdated, "chunks_deleted", summary.ChunksDeleted)
 
 	filesCount, chunksCount, err := f.countStoredStats(ctx)
 	if err != nil {

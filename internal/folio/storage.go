@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // OpenDatabase opens or creates a SQLite database at the provided path and
@@ -16,10 +17,13 @@ func OpenDatabase(ctx context.Context, path string) (*sql.DB, error) {
 		return nil, fmt.Errorf("create db directory: %w", err)
 	}
 
-	db, err := sql.Open("sqlite3", path)
+	dsn := ensureSQLiteOptions(path)
+	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 
 	if err := db.PingContext(ctx); err != nil {
 		db.Close()
@@ -53,4 +57,22 @@ CREATE INDEX IF NOT EXISTS idx_chunks_file_path ON chunks(file_path);
 		return fmt.Errorf("ensure schema: %w", err)
 	}
 	return nil
+}
+
+func ensureSQLiteOptions(path string) string {
+	dsn := path
+	dsn = appendDSNParam(dsn, "_busy_timeout", "8000")
+	dsn = appendDSNParam(dsn, "_journal_mode", "WAL")
+	return dsn
+}
+
+func appendDSNParam(dsn, key, value string) string {
+	if strings.Contains(dsn, key+"=") {
+		return dsn
+	}
+	sep := "?"
+	if strings.Contains(dsn, "?") {
+		sep = "&"
+	}
+	return dsn + sep + key + "=" + value
 }
