@@ -20,26 +20,39 @@ type chunkPosition struct {
 
 // Synchronize scans the root directory, chunks eligible files, and reconciles
 // the results with the SQLite database.
-func (f *Folio) Synchronize(ctx context.Context) error {
+// SyncSummary captures aggregate details about a synchronization run.
+type SyncSummary struct {
+	FilesProcessed int
+	FilesRemoved   int
+	ChunksInserted int
+	ChunksUpdated  int
+	ChunksDeleted  int
+	TotalFiles     int
+	TotalChunks    int
+}
+
+func (f *Folio) Synchronize(ctx context.Context) (SyncSummary, error) {
 	logger := f.loggerOrDefault()
 
 	files, err := CollectFiles(f.fs, f.root, f.opts.Extensions)
 	if err != nil {
-		return fmt.Errorf("collect files: %w", err)
+		return SyncSummary{}, fmt.Errorf("collect files: %w", err)
 	}
 	logger.Info("Collected files to process", "count", len(files))
 
 	existingFiles, err := f.loadExistingFiles(ctx)
 	if err != nil {
-		return err
+		return SyncSummary{}, err
 	}
 
 	totals := chunkSyncStats{}
+	summary := SyncSummary{}
+	summary.FilesProcessed = len(files)
 
 	for _, relPath := range files {
 		stats, syncErr := f.SyncPath(ctx, relPath)
 		if syncErr != nil {
-			return fmt.Errorf("sync file %s: %w", relPath, syncErr)
+			return SyncSummary{}, fmt.Errorf("sync file %s: %w", relPath, syncErr)
 		}
 		totals.inserted += stats.inserted
 		totals.updated += stats.updated
@@ -52,15 +65,26 @@ func (f *Folio) Synchronize(ctx context.Context) error {
 	for relPath := range existingFiles {
 		stats, syncErr := f.SyncPath(ctx, relPath)
 		if syncErr != nil {
-			return fmt.Errorf("sync file %s: %w", relPath, syncErr)
+			return SyncSummary{}, fmt.Errorf("sync file %s: %w", relPath, syncErr)
 		}
 		totals.deleted += stats.deleted
 		delete(existingFiles, relPath)
 	}
+	summary.FilesRemoved = removedCount
+	summary.ChunksInserted = totals.inserted
+	summary.ChunksUpdated = totals.updated
+	summary.ChunksDeleted = totals.deleted
 
 	logger.Info("Synchronization complete", "processed_files", len(files), "removed_files", removedCount, "chunks_inserted", totals.inserted, "chunks_updated", totals.updated, "chunks_deleted", totals.deleted)
 
-	return nil
+	filesCount, chunksCount, err := f.countStoredStats(ctx)
+	if err != nil {
+		return SyncSummary{}, err
+	}
+	summary.TotalFiles = filesCount
+	summary.TotalChunks = chunksCount
+
+	return summary, nil
 }
 
 func (f *Folio) loadExistingFiles(ctx context.Context) (map[string]struct{}, error) {
@@ -83,6 +107,17 @@ func (f *Folio) loadExistingFiles(ctx context.Context) (map[string]struct{}, err
 	}
 
 	return existing, nil
+}
+
+func (f *Folio) countStoredStats(ctx context.Context) (int, int, error) {
+	var fileCount, chunkCount int
+	if err := f.db.QueryRowContext(ctx, `SELECT COUNT(DISTINCT file_path) FROM chunks`).Scan(&fileCount); err != nil {
+		return 0, 0, fmt.Errorf("count files: %w", err)
+	}
+	if err := f.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM chunks`).Scan(&chunkCount); err != nil {
+		return 0, 0, fmt.Errorf("count chunks: %w", err)
+	}
+	return fileCount, chunkCount, nil
 }
 
 func (f *Folio) syncFileChunks(ctx context.Context, tx *sql.Tx, filePath string, chunks []Chunk) (chunkSyncStats, error) {
