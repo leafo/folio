@@ -187,15 +187,17 @@ func (f *Folio) applyIncrementalChanges(ctx context.Context, changed, removedDir
 	sort.Strings(removedDirList)
 
 	totals := chunkSyncStats{}
+	var changes ChunkChangeSet
 
 	for _, rel := range changedList {
-		stats, syncErr := f.SyncPath(ctx, rel)
+		stats, delta, syncErr := f.SyncPath(ctx, rel)
 		if syncErr != nil {
 			return syncErr
 		}
 		totals.inserted += stats.inserted
 		totals.updated += stats.updated
 		totals.deleted += stats.deleted
+		changes.Merge(delta)
 	}
 
 	for _, rel := range removedDirList {
@@ -205,19 +207,20 @@ func (f *Folio) applyIncrementalChanges(ctx context.Context, changed, removedDir
 		}
 		dirDeleted := 0
 		for _, file := range files {
-			stats, syncErr := f.SyncPath(ctx, file)
+			stats, delta, syncErr := f.SyncPath(ctx, file)
 			if syncErr != nil {
 				return syncErr
 			}
 			dirDeleted += stats.deleted
 			totals.deleted += stats.deleted
+			changes.Merge(delta)
 		}
 		logger.Debug("Removed directory from index", "directory", rel, "files", len(files), "chunks", dirDeleted)
 	}
 
 	logger.Debug("Incremental synchronization summary", "updated_files", len(changedList), "removed_dirs", len(removedDirList), "chunks_inserted", totals.inserted, "chunks_updated", totals.updated, "chunks_deleted", totals.deleted)
 
-	return nil
+	return f.dispatchChunkChanges(ctx, changes)
 }
 
 func makeExtensionSet(exts []string) map[string]struct{} {

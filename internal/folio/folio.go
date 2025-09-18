@@ -18,16 +18,18 @@ type Options struct {
 	ChunkSize    int
 	ChunkOverlap int
 	IgnoreDirs   []string
+	Meilisearch  MeilisearchConfig
 }
 
 // Folio manages scanning, chunking, and persisting file content metadata.
 type Folio struct {
-	db     *sql.DB
-	root   string
-	opts   Options
-	logger *slog.Logger
-	fs     FileSystem
-	force  bool
+	db      *sql.DB
+	root    string
+	opts    Options
+	logger  *slog.Logger
+	fs      FileSystem
+	force   bool
+	targets []ChunkSyncTarget
 }
 
 // NewFolio constructs a Folio instance using the provided database connection and configuration.
@@ -44,6 +46,7 @@ func NewFolio(db *sql.DB, root string, opts Options, logger *slog.Logger) *Folio
 		fs:     OSFileSystem{},
 		force:  false,
 	}
+	f.initMeilisearch()
 	return f
 }
 
@@ -59,6 +62,14 @@ func (f *Folio) SetFileSystem(fs FileSystem) {
 // SetForceProcessing toggles whether SyncPath should bypass metadata shortcuts.
 func (f *Folio) SetForceProcessing(force bool) {
 	f.force = force
+}
+
+// RegisterSyncTarget registers a sync target to receive chunk change notifications.
+func (f *Folio) RegisterSyncTarget(target ChunkSyncTarget) {
+	if target == nil {
+		return
+	}
+	f.targets = append(f.targets, target)
 }
 
 func (f *Folio) chunkOptions() ChunkOptions {
@@ -98,90 +109,97 @@ func (f *Folio) relativePath(path string) string {
 }
 
 // SyncPath chunks the provided relative file path and reconciles its state in the database.
-func (f *Folio) SyncPath(ctx context.Context, relPath string) (chunkSyncStats, error) {
+func (f *Folio) SyncPath(ctx context.Context, relPath string) (chunkSyncStats, ChunkChangeSet, error) {
+	var changes ChunkChangeSet
+
 	if !f.shouldIndex(relPath) {
 		tx, err := f.db.BeginTx(ctx, nil)
 		if err != nil {
-			return chunkSyncStats{}, fmt.Errorf("begin transaction: %w", err)
+			return chunkSyncStats{}, ChunkChangeSet{}, fmt.Errorf("begin transaction: %w", err)
 		}
-		deleted, err := f.deleteFileRecords(ctx, tx, relPath)
+		deleted, ids, err := f.deleteFileRecords(ctx, tx, relPath)
 		if err != nil {
 			tx.Rollback()
-			return chunkSyncStats{}, err
+			return chunkSyncStats{}, ChunkChangeSet{}, err
 		}
 		if err := tx.Commit(); err != nil {
-			return chunkSyncStats{}, fmt.Errorf("commit transaction: %w", err)
+			return chunkSyncStats{}, ChunkChangeSet{}, fmt.Errorf("commit transaction: %w", err)
 		}
 		if deleted > 0 {
 			f.loggerOrDefault().Info("Removed file from index", "file_path", relPath, "deleted", deleted, "reason", "filtered")
 		}
-		return chunkSyncStats{deleted: deleted}, nil
+		changes.Deletions = append(changes.Deletions, ids...)
+		return chunkSyncStats{deleted: deleted}, changes, nil
 	}
 
 	tx, err := f.db.BeginTx(ctx, nil)
 	if err != nil {
-		return chunkSyncStats{}, fmt.Errorf("begin transaction: %w", err)
+		return chunkSyncStats{}, ChunkChangeSet{}, fmt.Errorf("begin transaction: %w", err)
 	}
-	stats, err := f.syncPathTx(ctx, tx, relPath)
+	stats, delta, err := f.syncPathTx(ctx, tx, relPath)
 	if err != nil {
 		tx.Rollback()
-		return chunkSyncStats{}, err
+		return chunkSyncStats{}, ChunkChangeSet{}, err
 	}
 	if err := tx.Commit(); err != nil {
-		return chunkSyncStats{}, fmt.Errorf("commit transaction: %w", err)
+		return chunkSyncStats{}, ChunkChangeSet{}, fmt.Errorf("commit transaction: %w", err)
 	}
-	return stats, nil
+	changes.Merge(delta)
+	return stats, changes, nil
 }
 
-func (f *Folio) syncPathTx(ctx context.Context, tx *sql.Tx, relPath string) (chunkSyncStats, error) {
+func (f *Folio) syncPathTx(ctx context.Context, tx *sql.Tx, relPath string) (chunkSyncStats, ChunkChangeSet, error) {
 	logger := f.loggerOrDefault()
+	var changes ChunkChangeSet
 
 	absPath := f.absPath(relPath)
 	info, statErr := f.fs.Stat(absPath)
 	if statErr != nil {
 		if errors.Is(statErr, fs.ErrNotExist) {
-			deleted, delErr := f.deleteFileRecords(ctx, tx, relPath)
+			deleted, ids, delErr := f.deleteFileRecords(ctx, tx, relPath)
 			if delErr != nil {
-				return chunkSyncStats{}, delErr
+				return chunkSyncStats{}, ChunkChangeSet{}, delErr
 			}
 			logger.Info("Removed file from index", "file_path", relPath, "deleted", deleted)
-			return chunkSyncStats{deleted: deleted}, nil
+			changes.Deletions = append(changes.Deletions, ids...)
+			return chunkSyncStats{deleted: deleted}, changes, nil
 		}
-		return chunkSyncStats{}, fmt.Errorf("stat file %s: %w", relPath, statErr)
+		return chunkSyncStats{}, ChunkChangeSet{}, fmt.Errorf("stat file %s: %w", relPath, statErr)
 	}
 
 	currentMeta := fileMetadata{size: info.Size(), mtimeNS: info.ModTime().UnixNano()}
 	if !f.force {
 		storedMeta, ok, err := f.loadFileMetadata(ctx, tx, relPath)
 		if err != nil {
-			return chunkSyncStats{}, err
+			return chunkSyncStats{}, ChunkChangeSet{}, err
 		}
 		if ok && storedMeta.size == currentMeta.size && storedMeta.mtimeNS == currentMeta.mtimeNS {
-			return chunkSyncStats{}, nil
+			return chunkSyncStats{}, ChunkChangeSet{}, nil
 		}
 	}
 
 	chunks, err := f.chunkFile(relPath)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			deleted, delErr := f.deleteFileRecords(ctx, tx, relPath)
+			deleted, ids, delErr := f.deleteFileRecords(ctx, tx, relPath)
 			if delErr != nil {
-				return chunkSyncStats{}, delErr
+				return chunkSyncStats{}, ChunkChangeSet{}, delErr
 			}
 			logger.Info("Removed file from index", "file_path", relPath, "deleted", deleted)
-			return chunkSyncStats{deleted: deleted}, nil
+			changes.Deletions = append(changes.Deletions, ids...)
+			return chunkSyncStats{deleted: deleted}, changes, nil
 		}
-		return chunkSyncStats{}, err
+		return chunkSyncStats{}, ChunkChangeSet{}, err
 	}
-	stats, err := f.syncFileChunks(ctx, tx, relPath, chunks)
+	stats, err := f.syncFileChunks(ctx, tx, relPath, chunks, &changes)
 	if err != nil {
-		return chunkSyncStats{}, err
+		return chunkSyncStats{}, ChunkChangeSet{}, err
 	}
 	if err := f.upsertFileMetadata(ctx, tx, relPath, currentMeta); err != nil {
-		return chunkSyncStats{}, err
+		return chunkSyncStats{}, ChunkChangeSet{}, err
 	}
 	logger.Info("Synced file", "file_path", relPath, "chunks", len(chunks), "inserted", stats.inserted, "updated", stats.updated, "deleted", stats.deleted)
-	return stats, nil
+	return stats, changes, nil
 }
 
 func (f *Folio) loggerOrDefault() *slog.Logger {
@@ -220,4 +238,16 @@ func pathMatchesIgnore(relPath string, ignore []string) bool {
 		}
 	}
 	return false
+}
+
+func (f *Folio) dispatchChunkChanges(ctx context.Context, changes ChunkChangeSet) error {
+	if changes.IsEmpty() || len(f.targets) == 0 {
+		return nil
+	}
+	for _, target := range f.targets {
+		if err := target.ApplyChunkChanges(ctx, changes); err != nil {
+			return err
+		}
+	}
+	return nil
 }

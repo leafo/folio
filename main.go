@@ -37,11 +37,17 @@ func main() {
 		listFiles         bool
 		writeConfig       bool
 		ignoreDirectories string
+		meiliHost         string
+		meiliAPIKey       string
+		meiliIndex        string
 		force             bool
 	)
 
 	defaultExtensions := strings.Join(cfg.Extensions, ",")
 	defaultIgnore := strings.Join(cfg.IgnoreDirs, ",")
+	defaultMeiliHost := strings.TrimSpace(cfg.Meilisearch.Host)
+	defaultMeiliAPIKey := strings.TrimSpace(cfg.Meilisearch.APIKey)
+	defaultMeiliIndex := strings.TrimSpace(cfg.Meilisearch.Index)
 
 	flag.StringVar(&root, "root", cfg.Root, "root directory to scan")
 	flag.StringVar(&dbPath, "db", cfg.DBPath, "path to the SQLite database file")
@@ -49,6 +55,9 @@ func main() {
 	flag.IntVar(&chunkOverlap, "chunk-overlap", cfg.ChunkOverlap, "number of overlapping lines between consecutive chunks")
 	flag.StringVar(&extensions, "extensions", defaultExtensions, "comma separated list of file extensions to include")
 	flag.StringVar(&ignoreDirectories, "ignore-directories", defaultIgnore, "comma separated list of directories to ignore")
+	flag.StringVar(&meiliHost, "meili-host", defaultMeiliHost, "Meilisearch host URL")
+	flag.StringVar(&meiliAPIKey, "meili-api-key", defaultMeiliAPIKey, "Meilisearch API key")
+	flag.StringVar(&meiliIndex, "meili-index", defaultMeiliIndex, "Meilisearch index name")
 	flag.BoolVar(&watchMode, "watch", false, "enable watch mode to process changes continuously")
 	flag.StringVar(&showFile, "show-file", "", "show stored chunks for the given file and exit")
 	flag.BoolVar(&listFiles, "list", false, "list tracked files and exit")
@@ -79,6 +88,9 @@ func main() {
 
 	ignoreList := normalizeIgnoreDirs(parseList(ignoreDirectories))
 	cfg.IgnoreDirs = ignoreList
+	cfg.Meilisearch.Host = strings.TrimSpace(meiliHost)
+	cfg.Meilisearch.APIKey = strings.TrimSpace(meiliAPIKey)
+	cfg.Meilisearch.Index = strings.TrimSpace(meiliIndex)
 
 	cfg.Root = root
 	cfg.DBPath = dbPath

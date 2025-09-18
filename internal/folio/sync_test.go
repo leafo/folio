@@ -39,7 +39,7 @@ func TestSyncFileChunksInsertUpdateDelete(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin tx failed: %v", err)
 	}
-	stats, err := folio.syncFileChunks(ctx, tx, filePath, chunksInitial)
+	stats, err := folio.syncFileChunks(ctx, tx, filePath, chunksInitial, &ChunkChangeSet{})
 	if err != nil {
 		t.Fatalf("syncFileChunks insert failed: %v", err)
 	}
@@ -62,7 +62,7 @@ func TestSyncFileChunksInsertUpdateDelete(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin tx failed: %v", err)
 	}
-	stats, err = folio.syncFileChunks(ctx, tx, filePath, chunksUpdated)
+	stats, err = folio.syncFileChunks(ctx, tx, filePath, chunksUpdated, &ChunkChangeSet{})
 	if err != nil {
 		t.Fatalf("syncFileChunks update failed: %v", err)
 	}
@@ -83,7 +83,7 @@ func TestSyncFileChunksInsertUpdateDelete(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin tx failed: %v", err)
 	}
-	stats, err = folio.syncFileChunks(ctx, tx, filePath, chunksFinal)
+	stats, err = folio.syncFileChunks(ctx, tx, filePath, chunksFinal, &ChunkChangeSet{})
 	if err != nil {
 		t.Fatalf("syncFileChunks delete failed: %v", err)
 	}

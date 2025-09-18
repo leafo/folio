@@ -56,6 +56,8 @@ func (f *Folio) Synchronize(ctx context.Context) (SyncSummary, error) {
 	summary := SyncSummary{}
 	summary.FilesProcessed = len(files)
 
+	var changes ChunkChangeSet
+
 	var existingMu sync.Mutex
 	var inserted atomic.Int64
 	var updated atomic.Int64
@@ -121,7 +123,7 @@ func (f *Folio) Synchronize(ctx context.Context) (SyncSummary, error) {
 	}
 
 	if err := runPaths(files, func(rel string) error {
-		stats, syncErr := f.SyncPath(ctx, rel)
+		stats, delta, syncErr := f.SyncPath(ctx, rel)
 		if syncErr != nil {
 			return fmt.Errorf("sync file %s: %w", rel, syncErr)
 		}
@@ -134,6 +136,7 @@ func (f *Folio) Synchronize(ctx context.Context) (SyncSummary, error) {
 		delete(existingFiles, rel)
 		existingMu.Unlock()
 
+		changes.Merge(delta)
 		return nil
 	}); err != nil {
 		return SyncSummary{}, err
@@ -148,13 +151,14 @@ func (f *Folio) Synchronize(ctx context.Context) (SyncSummary, error) {
 	summary.FilesRemoved = len(remaining)
 
 	if err := runPaths(remaining, func(rel string) error {
-		stats, syncErr := f.SyncPath(ctx, rel)
+		stats, delta, syncErr := f.SyncPath(ctx, rel)
 		if syncErr != nil {
 			return fmt.Errorf("sync file %s: %w", rel, syncErr)
 		}
 		inserted.Add(int64(stats.inserted))
 		updated.Add(int64(stats.updated))
 		deleted.Add(int64(stats.deleted))
+		changes.Merge(delta)
 		return nil
 	}); err != nil {
 		return SyncSummary{}, err
@@ -172,6 +176,10 @@ func (f *Folio) Synchronize(ctx context.Context) (SyncSummary, error) {
 	}
 	summary.TotalFiles = filesCount
 	summary.TotalChunks = chunksCount
+
+	if err := f.dispatchChunkChanges(ctx, changes); err != nil {
+		return SyncSummary{}, err
+	}
 
 	return summary, nil
 }
@@ -209,7 +217,7 @@ func (f *Folio) countStoredStats(ctx context.Context) (int, int, error) {
 	return fileCount, chunkCount, nil
 }
 
-func (f *Folio) syncFileChunks(ctx context.Context, tx *sql.Tx, filePath string, chunks []Chunk) (chunkSyncStats, error) {
+func (f *Folio) syncFileChunks(ctx context.Context, tx *sql.Tx, filePath string, chunks []Chunk, changes *ChunkChangeSet) (chunkSyncStats, error) {
 	existing, err := loadExistingChunks(ctx, tx, filePath)
 	if err != nil {
 		return chunkSyncStats{}, err
@@ -234,6 +242,9 @@ WHERE file_path = ? AND start_line = ? AND end_line = ?
 				return chunkSyncStats{}, fmt.Errorf("update chunk: %w", execErr)
 			}
 			stats.updated++
+			if changes != nil {
+				changes.Upserts = append(changes.Upserts, chunk)
+			}
 			continue
 		}
 
@@ -244,6 +255,9 @@ VALUES (?, ?, ?, ?, ?)
 			return chunkSyncStats{}, fmt.Errorf("insert chunk: %w", execErr)
 		}
 		stats.inserted++
+		if changes != nil {
+			changes.Upserts = append(changes.Upserts, chunk)
+		}
 	}
 
 	for pos := range existing {
@@ -254,24 +268,46 @@ VALUES (?, ?, ?, ?, ?)
 			return chunkSyncStats{}, fmt.Errorf("delete stale chunk: %w", execErr)
 		}
 		stats.deleted++
+		if changes != nil {
+			changes.Deletions = append(changes.Deletions, ChunkIdentifier{FilePath: filePath, StartLine: pos.start, EndLine: pos.end})
+		}
 	}
 
 	return stats, nil
 }
 
-func (f *Folio) deleteFileRecords(ctx context.Context, tx *sql.Tx, filePath string) (int, error) {
+func (f *Folio) deleteFileRecords(ctx context.Context, tx *sql.Tx, filePath string) (int, []ChunkIdentifier, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT start_line, end_line FROM chunks WHERE file_path = ?`, filePath)
+	if err != nil {
+		return 0, nil, fmt.Errorf("select chunks for %s: %w", filePath, err)
+	}
+	var ids []ChunkIdentifier
+	for rows.Next() {
+		var start, end int
+		if err := rows.Scan(&start, &end); err != nil {
+			rows.Close()
+			return 0, nil, fmt.Errorf("scan chunk position for %s: %w", filePath, err)
+		}
+		ids = append(ids, ChunkIdentifier{FilePath: filePath, StartLine: start, EndLine: end})
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, nil, fmt.Errorf("iterate chunk positions for %s: %w", filePath, err)
+	}
+	rows.Close()
+
 	res, err := tx.ExecContext(ctx, `DELETE FROM chunks WHERE file_path = ?`, filePath)
 	if err != nil {
-		return 0, fmt.Errorf("delete file %s: %w", filePath, err)
+		return 0, nil, fmt.Errorf("delete file %s: %w", filePath, err)
 	}
 	affected, err := res.RowsAffected()
 	if err != nil {
-		return 0, fmt.Errorf("rows affected for %s: %w", filePath, err)
+		return 0, nil, fmt.Errorf("rows affected for %s: %w", filePath, err)
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM file_metadata WHERE file_path = ?`, filePath); err != nil {
-		return 0, fmt.Errorf("delete metadata %s: %w", filePath, err)
+		return 0, nil, fmt.Errorf("delete metadata %s: %w", filePath, err)
 	}
-	return int(affected), nil
+	return int(affected), ids, nil
 }
 
 func (f *Folio) loadFileMetadata(ctx context.Context, tx *sql.Tx, filePath string) (fileMetadata, bool, error) {
