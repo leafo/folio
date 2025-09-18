@@ -22,8 +22,10 @@ type chunkPosition struct {
 }
 
 type fileMetadata struct {
-	size    int64
-	mtimeNS int64
+	size         int64
+	mtimeNS      int64
+	chunkSize    int
+	chunkOverlap int
 }
 
 // SyncSummary captures aggregate details about a synchronization run.
@@ -311,9 +313,9 @@ func (f *Folio) deleteFileRecords(ctx context.Context, tx *sql.Tx, filePath stri
 }
 
 func (f *Folio) loadFileMetadata(ctx context.Context, tx *sql.Tx, filePath string) (fileMetadata, bool, error) {
-	row := tx.QueryRowContext(ctx, `SELECT size, mtime_ns FROM file_metadata WHERE file_path = ?`, filePath)
+	row := tx.QueryRowContext(ctx, `SELECT size, mtime_ns, chunk_size, chunk_overlap FROM file_metadata WHERE file_path = ?`, filePath)
 	var meta fileMetadata
-	switch err := row.Scan(&meta.size, &meta.mtimeNS); err {
+	switch err := row.Scan(&meta.size, &meta.mtimeNS, &meta.chunkSize, &meta.chunkOverlap); err {
 	case nil:
 		return meta, true, nil
 	case sql.ErrNoRows:
@@ -325,13 +327,15 @@ func (f *Folio) loadFileMetadata(ctx context.Context, tx *sql.Tx, filePath strin
 
 func (f *Folio) upsertFileMetadata(ctx context.Context, tx *sql.Tx, filePath string, meta fileMetadata) error {
 	if _, err := tx.ExecContext(ctx, `
-INSERT INTO file_metadata (file_path, size, mtime_ns, updated_at)
-VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+INSERT INTO file_metadata (file_path, size, mtime_ns, chunk_size, chunk_overlap, updated_at)
+VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 ON CONFLICT(file_path) DO UPDATE
 SET size = excluded.size,
     mtime_ns = excluded.mtime_ns,
+    chunk_size = excluded.chunk_size,
+    chunk_overlap = excluded.chunk_overlap,
     updated_at = CURRENT_TIMESTAMP
-`, filePath, meta.size, meta.mtimeNS); err != nil {
+`, filePath, meta.size, meta.mtimeNS, meta.chunkSize, meta.chunkOverlap); err != nil {
 		return fmt.Errorf("upsert file metadata %s: %w", filePath, err)
 	}
 	return nil

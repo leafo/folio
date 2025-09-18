@@ -167,13 +167,19 @@ func (f *Folio) syncPathTx(ctx context.Context, tx *sql.Tx, relPath string) (chu
 		return chunkSyncStats{}, ChunkChangeSet{}, fmt.Errorf("stat file %s: %w", relPath, statErr)
 	}
 
-	currentMeta := fileMetadata{size: info.Size(), mtimeNS: info.ModTime().UnixNano()}
+	currentMeta := fileMetadata{
+		size:         info.Size(),
+		mtimeNS:      info.ModTime().UnixNano(),
+		chunkSize:    f.opts.ChunkSize,
+		chunkOverlap: f.opts.ChunkOverlap,
+	}
 	if !f.force {
 		storedMeta, ok, err := f.loadFileMetadata(ctx, tx, relPath)
 		if err != nil {
 			return chunkSyncStats{}, ChunkChangeSet{}, err
 		}
-		if ok && storedMeta.size == currentMeta.size && storedMeta.mtimeNS == currentMeta.mtimeNS {
+		if ok && storedMeta.size == currentMeta.size && storedMeta.mtimeNS == currentMeta.mtimeNS &&
+			storedMeta.chunkSize == currentMeta.chunkSize && storedMeta.chunkOverlap == currentMeta.chunkOverlap {
 			return chunkSyncStats{}, ChunkChangeSet{}, nil
 		}
 	}

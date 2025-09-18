@@ -55,6 +55,8 @@ CREATE TABLE IF NOT EXISTS file_metadata (
     file_path TEXT PRIMARY KEY,
     size INTEGER NOT NULL,
     mtime_ns INTEGER NOT NULL,
+    chunk_size INTEGER NOT NULL,
+    chunk_overlap INTEGER NOT NULL,
     updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 `
