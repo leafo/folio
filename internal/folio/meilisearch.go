@@ -31,8 +31,11 @@ func (f *Folio) initMeilisearch() {
 func newMeilisearchTarget(ctx context.Context, cfg MeilisearchConfig, logger *slog.Logger) (ChunkSyncTarget, error) {
 	host := strings.TrimSpace(cfg.Host)
 	indexName := strings.TrimSpace(cfg.Index)
-	if host == "" || indexName == "" {
+	if indexName == "" {
 		return nil, nil
+	}
+	if host == "" {
+		host = "http://localhost:7700"
 	}
 
 	client := meilisearch.NewClient(meilisearch.ClientConfig{

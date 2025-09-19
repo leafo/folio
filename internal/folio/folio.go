@@ -19,6 +19,7 @@ type Options struct {
 	ChunkOverlap int
 	IgnoreDirs   []string
 	Meilisearch  MeilisearchConfig
+	ShellTarget  *ShellTargetConfig
 }
 
 // Folio manages scanning, chunking, and persisting file content metadata.
@@ -46,7 +47,9 @@ func NewFolio(db *sql.DB, root string, opts Options, logger *slog.Logger) *Folio
 		fs:     OSFileSystem{},
 		force:  false,
 	}
+	f.opts.Meilisearch.applyDefaults()
 	f.initMeilisearch()
+	f.initShellTarget()
 	return f
 }
 
@@ -256,4 +259,12 @@ func (f *Folio) dispatchChunkChanges(ctx context.Context, changes ChunkChangeSet
 		}
 	}
 	return nil
+}
+
+func (f *Folio) initShellTarget() {
+	target := newShellTarget(f.opts.ShellTarget)
+	if target == nil {
+		return
+	}
+	f.RegisterSyncTarget(target)
 }

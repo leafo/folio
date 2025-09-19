@@ -40,14 +40,24 @@ func main() {
 		meiliHost         string
 		meiliAPIKey       string
 		meiliIndex        string
+		syncCommand       string
 		force             bool
 	)
 
 	defaultExtensions := strings.Join(cfg.Extensions, ",")
 	defaultIgnore := strings.Join(cfg.IgnoreDirs, ",")
-	defaultMeiliHost := strings.TrimSpace(cfg.Meilisearch.Host)
-	defaultMeiliAPIKey := strings.TrimSpace(cfg.Meilisearch.APIKey)
-	defaultMeiliIndex := strings.TrimSpace(cfg.Meilisearch.Index)
+	defaultMeiliHost := ""
+	defaultMeiliAPIKey := ""
+	defaultMeiliIndex := ""
+	if cfg.Meilisearch != nil {
+		defaultMeiliHost = strings.TrimSpace(cfg.Meilisearch.Host)
+		defaultMeiliAPIKey = strings.TrimSpace(cfg.Meilisearch.APIKey)
+		defaultMeiliIndex = strings.TrimSpace(cfg.Meilisearch.Index)
+	}
+	defaultShellCmd := ""
+	if cfg.ShellTarget != nil {
+		defaultShellCmd = strings.TrimSpace(cfg.ShellTarget.Command)
+	}
 
 	flag.StringVar(&root, "root", cfg.Root, "root directory to scan")
 	flag.StringVar(&dbPath, "db", cfg.DBPath, "path to the SQLite database file")
@@ -55,9 +65,10 @@ func main() {
 	flag.IntVar(&chunkOverlap, "chunk-overlap", cfg.ChunkOverlap, "number of overlapping lines between consecutive chunks")
 	flag.StringVar(&extensions, "extensions", defaultExtensions, "comma separated list of file extensions to include")
 	flag.StringVar(&ignoreDirectories, "ignore-directories", defaultIgnore, "comma separated list of directories to ignore")
-	flag.StringVar(&meiliHost, "meili-host", defaultMeiliHost, "Meilisearch host URL")
-	flag.StringVar(&meiliAPIKey, "meili-api-key", defaultMeiliAPIKey, "Meilisearch API key")
-	flag.StringVar(&meiliIndex, "meili-index", defaultMeiliIndex, "Meilisearch index name")
+	flag.StringVar(&meiliHost, "meilisearch-host", defaultMeiliHost, "Meilisearch host URL")
+	flag.StringVar(&meiliAPIKey, "meilisearch-api-key", defaultMeiliAPIKey, "Meilisearch API key")
+	flag.StringVar(&meiliIndex, "meilisearch-index", defaultMeiliIndex, "Meilisearch index name")
+	flag.StringVar(&syncCommand, "sync-cmd", defaultShellCmd, "Shell command to receive chunk changes via stdin")
 	flag.BoolVar(&watchMode, "watch", false, "enable watch mode to process changes continuously")
 	flag.StringVar(&showFile, "show-file", "", "show stored chunks for the given file and exit")
 	flag.BoolVar(&listFiles, "list", false, "list tracked files and exit")
@@ -88,9 +99,44 @@ func main() {
 
 	ignoreList := normalizeIgnoreDirs(parseList(ignoreDirectories))
 	cfg.IgnoreDirs = ignoreList
-	cfg.Meilisearch.Host = strings.TrimSpace(meiliHost)
-	cfg.Meilisearch.APIKey = strings.TrimSpace(meiliAPIKey)
-	cfg.Meilisearch.Index = strings.TrimSpace(meiliIndex)
+	flagSet := make(map[string]struct{})
+	flag.Visit(func(f *flag.Flag) {
+		flagSet[f.Name] = struct{}{}
+	})
+	_, meiliHostChanged := flagSet["meilisearch-host"]
+	_, meiliAPIKeyChanged := flagSet["meilisearch-api-key"]
+	_, meiliIndexChanged := flagSet["meilisearch-index"]
+
+	trimHost := strings.TrimSpace(meiliHost)
+	trimAPIKey := strings.TrimSpace(meiliAPIKey)
+	trimIndex := strings.TrimSpace(meiliIndex)
+
+	if meiliHostChanged || meiliAPIKeyChanged || meiliIndexChanged {
+		if trimHost == "" && trimAPIKey == "" && trimIndex == "" {
+			cfg.Meilisearch = nil
+		} else {
+			if cfg.Meilisearch == nil {
+				cfg.Meilisearch = &folio.MeilisearchConfig{}
+			}
+			if meiliHostChanged {
+				cfg.Meilisearch.Host = trimHost
+			}
+			if meiliAPIKeyChanged {
+				cfg.Meilisearch.APIKey = trimAPIKey
+			}
+			if meiliIndexChanged {
+				cfg.Meilisearch.Index = trimIndex
+			}
+		}
+	}
+	if syncCommandFlagSet := strings.TrimSpace(syncCommand); syncCommandFlagSet != "" {
+		if cfg.ShellTarget == nil {
+			cfg.ShellTarget = &folio.ShellTargetConfig{}
+		}
+		cfg.ShellTarget.Command = syncCommandFlagSet
+	} else if _, ok := flagSet["sync-cmd"]; ok {
+		cfg.ShellTarget = nil
+	}
 
 	cfg.Root = root
 	cfg.DBPath = dbPath
@@ -296,6 +342,12 @@ func loadConfigFile(path string, cfg *folio.Config) (bool, error) {
 }
 
 func writeConfigFile(path string, cfg folio.Config) error {
+	if cfg.Meilisearch != nil && cfg.Meilisearch.IsEmpty() {
+		cfg.Meilisearch = nil
+	}
+	if cfg.ShellTarget != nil && cfg.ShellTarget.IsEmpty() {
+		cfg.ShellTarget = nil
+	}
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
